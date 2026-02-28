@@ -327,6 +327,93 @@ def score_with_ngrok(
     return pd.DataFrame(rows)
 
 
+def parse_ngrok_predictions(raw_df: pd.DataFrame) -> pd.DataFrame:
+    """Flatten ngrok response_json into analytics-friendly columns."""
+    rows: list[dict] = []
+    for _, row in raw_df.iterrows():
+        payload = {}
+        try:
+            payload = json.loads(str(row.get("response_json", "{}")))
+        except json.JSONDecodeError:
+            payload = {}
+        rows.append(
+            {
+                "window_start_idx": int(row.get("window_start_idx", -1)),
+                "window_end_idx": int(row.get("window_end_idx", -1)),
+                "anomaly_score": payload.get("anomaly_score"),
+                "cluster": payload.get("cluster"),
+                "confidence": payload.get("confidence"),
+                "is_anomaly": payload.get("is_anomaly"),
+                "pattern_name": payload.get("pattern_name"),
+                "series_length": payload.get("series_length"),
+                "model_seq_len": payload.get("model_seq_len"),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def plot_ngrok_anomalies(
+    val_df: pd.DataFrame,
+    *,
+    target_col: str,
+    parsed_df: pd.DataFrame,
+    out_path: str,
+) -> None:
+    """Plot validation target series and mark predicted anomaly endpoints."""
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as e:
+        raise RuntimeError(
+            "matplotlib is required for plotting. Install with: python3 -m pip install matplotlib"
+        ) from e
+
+    series_df = pd.DataFrame({"value": pd.to_numeric(val_df[target_col], errors="coerce")})
+    series_df = series_df.dropna().reset_index()
+    # First column is the former index (could be named "index", "DATE", etc.).
+    ts_col = series_df.columns[0]
+    series_df = series_df.rename(columns={ts_col: "timestamp"})
+    series_df["row_idx"] = range(len(series_df))
+
+    is_anomaly = (
+        parsed_df["is_anomaly"]
+        .astype(str)
+        .str.lower()
+        .isin(["true", "1", "yes"])
+    )
+    anom = parsed_df[is_anomaly].copy()
+    if anom.empty:
+        anom_points = pd.DataFrame(columns=["timestamp", "value"])
+    else:
+        anom_points = anom.merge(
+            series_df[["row_idx", "timestamp", "value"]],
+            left_on="window_end_idx",
+            right_on="row_idx",
+            how="left",
+        )
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.plot(series_df["timestamp"], series_df["value"], linewidth=1.2, label=target_col)
+    if not anom_points.empty:
+        ax.scatter(
+            anom_points["timestamp"],
+            anom_points["value"],
+            color="red",
+            s=35,
+            label="Predicted anomaly",
+            zorder=3,
+        )
+    ax.set_title("Validation Series with Predicted Anomalies")
+    ax.set_xlabel("Time")
+    ax.set_ylabel(target_col)
+    ax.legend()
+    ax.grid(alpha=0.2)
+    fig.tight_layout()
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Time-series preprocessing starter")
     parser.add_argument("--data", required=True, help="Path to CSV")
@@ -421,6 +508,16 @@ def main() -> None:
         default="results/ngrok_predictions.csv",
         help="Where to save ngrok prediction responses.",
     )
+    parser.add_argument(
+        "--ngrok-parsed-output",
+        default="results/ngrok_predictions_parsed.csv",
+        help="Where to save flattened ngrok prediction columns.",
+    )
+    parser.add_argument(
+        "--ngrok-plot-output",
+        default="results/ngrok_anomalies.png",
+        help="Where to save anomaly plot image.",
+    )
     args = parser.parse_args()
 
     print("Loading data...", flush=True)
@@ -501,6 +598,20 @@ def main() -> None:
         ngrok_out.parent.mkdir(parents=True, exist_ok=True)
         ngrok_pred_df.to_csv(ngrok_out, index=False)
         print(f"Ngrok predictions saved: {ngrok_out}")
+
+        parsed_df = parse_ngrok_predictions(ngrok_pred_df)
+        parsed_out = Path(args.ngrok_parsed_output)
+        parsed_out.parent.mkdir(parents=True, exist_ok=True)
+        parsed_df.to_csv(parsed_out, index=False)
+        print(f"Parsed ngrok predictions saved: {parsed_out}")
+
+        plot_ngrok_anomalies(
+            split.val,
+            target_col=args.target_col,
+            parsed_df=parsed_df,
+            out_path=args.ngrok_plot_output,
+        )
+        print(f"Ngrok anomaly plot saved: {args.ngrok_plot_output}")
 
 
 if __name__ == "__main__":

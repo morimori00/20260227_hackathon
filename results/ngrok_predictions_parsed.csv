@@ -1,0 +1,2 @@
+window_start_idx,window_end_idx,anomaly_score,cluster,confidence,is_anomaly,pattern_name,series_length,model_seq_len
+53452,53511,0.565,1,0.435,True,Cyclic,60,60
