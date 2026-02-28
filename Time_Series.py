@@ -4,9 +4,11 @@ import argparse
 import json
 import math
 import os
+import ssl
+import time
 import urllib.parse
 import urllib.request
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -56,6 +58,7 @@ def clean_data(
     fill_method: str = "ffill",
     date_format: str | None = None,
     dayfirst: bool = False,
+    debug_date_parsing: bool = False,
 ) -> pd.DataFrame:
     """
     Parse/sort by timestamp and handle missing values.
@@ -68,13 +71,55 @@ def clean_data(
         raise ValueError(f"Missing timestamp column: {timestamp_col}")
 
     out = df.copy()
-    out[timestamp_col] = pd.to_datetime(
-        out[timestamp_col],
+    s = out[timestamp_col].astype(str).str.strip()
+
+    if debug_date_parsing:
+        print("COLUMNS:", out.columns.tolist(), flush=True)
+        print("RAW DATE HEAD:", s.head(5).tolist(), flush=True)
+
+    parsed = pd.to_datetime(
+        s,
         errors="coerce",
         format=date_format,
         dayfirst=dayfirst,
     )
+
+    if debug_date_parsing:
+        print("PARSED DATE HEAD:", parsed.head(5).tolist(), flush=True)
+        print("NaT %:", float(parsed.isna().mean()), flush=True)
+
+    # Fallback for Excel serial date values (e.g., 45205).
+    if parsed.isna().all():
+        nums = pd.to_numeric(s, errors="coerce")
+        parsed_excel = pd.to_datetime(
+            nums,
+            unit="D",
+            origin="1899-12-30",
+            errors="coerce",
+        )
+        if debug_date_parsing:
+            print("EXCEL PARSED HEAD:", parsed_excel.head(5).tolist(), flush=True)
+            print("Excel NaT %:", float(parsed_excel.isna().mean()), flush=True)
+        if parsed_excel.notna().any():
+            parsed = parsed_excel
+
+    if parsed.isna().all():
+        raw_samples = s.head(5).tolist()
+        raise ValueError(
+            "Timestamp parsing failed: all values became NaT. "
+            f"Timestamp column '{timestamp_col}' sample values: {raw_samples}. "
+            "Try setting the correct date format (e.g. %Y-%m-%d, %d-%b-%y), "
+            "toggle day-first, or verify the selected timestamp column."
+        )
+
+    out[timestamp_col] = parsed
     out = out.dropna(subset=[timestamp_col]).sort_values(timestamp_col)
+
+    min_d = out[timestamp_col].min()
+    max_d = out[timestamp_col].max()
+    if debug_date_parsing:
+        print("DATE RANGE:", min_d, "to", max_d, flush=True)
+
     out = out.set_index(timestamp_col)
 
     if fill_method == "ffill":
@@ -175,28 +220,59 @@ def evaluate_naive_baseline(
     return Metrics(mae=mae, rmse=rmse)
 
 
-def _post_json(url: str, payload: dict, headers: dict[str, str]) -> dict:
+def _post_json(
+    url: str,
+    payload: dict,
+    headers: dict[str, str],
+    *,
+    retries: int = 3,
+    backoff_seconds: float = 1.0,
+) -> dict:
     body = json.dumps(payload).encode("utf-8")
     merged_headers = {"Content-Type": "application/json", **headers}
-    req = urllib.request.Request(url, data=body, headers=merged_headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except HTTPError as e:
-        details = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(
-            f"Watson scoring request failed ({e.code} {e.reason}). Details: {details}"
-        ) from e
+    last_exc: Exception | None = None
+    for attempt in range(1, retries + 1):
+        req = urllib.request.Request(url, data=body, headers=merged_headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except HTTPError as e:
+            details = e.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"POST request failed ({e.code} {e.reason}). Details: {details}"
+            ) from e
+        except (URLError, ssl.SSLError, TimeoutError) as e:
+            last_exc = e
+            if attempt == retries:
+                break
+            time.sleep(backoff_seconds * attempt)
+    raise RuntimeError(f"POST request failed after {retries} retries: {last_exc}")
 
 
-def _get_json(url: str, headers: dict[str, str] | None = None) -> dict:
-    req = urllib.request.Request(url, headers=headers or {}, method="GET")
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except HTTPError as e:
-        details = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"GET request failed ({e.code} {e.reason}). Details: {details}") from e
+def _get_json(
+    url: str,
+    headers: dict[str, str] | None = None,
+    *,
+    retries: int = 3,
+    backoff_seconds: float = 1.0,
+) -> dict:
+    last_exc: Exception | None = None
+    for attempt in range(1, retries + 1):
+        req = urllib.request.Request(url, headers=headers or {}, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except HTTPError as e:
+            details = e.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"GET request failed ({e.code} {e.reason}). Details: {details}"
+            ) from e
+        except (URLError, ssl.SSLError, TimeoutError) as e:
+            last_exc = e
+            if attempt == retries:
+                break
+            time.sleep(backoff_seconds * attempt)
+    raise RuntimeError(f"GET request failed after {retries} retries: {last_exc}")
 
 
 def get_ibm_iam_token(apikey: str) -> str:
@@ -307,14 +383,32 @@ def score_with_ngrok(
         )
 
     rows = []
-    start = len(series) - window_size
-    windows_sent = 0
-    for i in range(start, len(series) - window_size + 1):
-        if windows_sent >= max_windows:
-            break
+    total_windows = len(series) - window_size + 1
+    if total_windows <= 0:
+        raise ValueError("No valid windows available for ngrok scoring.")
+
+    # Score windows across the full validation range (not only the tail).
+    if max_windows >= total_windows:
+        start_indices = list(range(total_windows))
+    else:
+        # Evenly sample window starts over the full range.
+        step = max(1, total_windows // max_windows)
+        start_indices = list(range(0, total_windows, step))[:max_windows]
+
+    for i in start_indices:
         window = series[i : i + window_size]
         payload = {"series": window, "anomaly_threshold": ngrok.anomaly_threshold}
-        resp = _post_json(f"{ngrok.base_url.rstrip('/')}/predict", payload, headers={})
+        try:
+            resp = _post_json(
+                f"{ngrok.base_url.rstrip('/')}/predict",
+                payload,
+                headers={},
+                retries=3,
+                backoff_seconds=1.0,
+            )
+        except RuntimeError as e:
+            print(f"Warning: skipped window {i} due to ngrok error: {e}", flush=True)
+            continue
         rows.append(
             {
                 "window_start_idx": i,
@@ -322,8 +416,8 @@ def score_with_ngrok(
                 "response_json": json.dumps(resp),
             }
         )
-        windows_sent += 1
-
+    if not rows:
+        raise RuntimeError("All ngrok window scoring requests failed.")
     return pd.DataFrame(rows)
 
 
@@ -440,6 +534,11 @@ def main() -> None:
         help="Parse day first in dates (e.g. 29-06-2017).",
     )
     parser.add_argument(
+        "--debug-date-parsing",
+        action="store_true",
+        help="Print timestamp parsing diagnostics (raw/parsed head, NaT %, date range).",
+    )
+    parser.add_argument(
         "--use-watson",
         action="store_true",
         help="Score validation rows using an IBM Watson ML deployment.",
@@ -530,6 +629,7 @@ def main() -> None:
         args.timestamp_col,
         date_format=args.date_format,
         dayfirst=args.dayfirst,
+        debug_date_parsing=args.debug_date_parsing,
     )
     print("Building features...", flush=True)
     df = make_features(df, args.target_col)

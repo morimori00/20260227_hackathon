@@ -1,0 +1,9 @@
+services:
+  ts-anomaly-app:
+    build: .
+    container_name: ts-anomaly-app
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./:/app
+    restart: unless-stopped
